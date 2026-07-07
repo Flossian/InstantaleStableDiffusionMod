@@ -1,0 +1,40 @@
+; stable-diffusion.dll (プロキシ) のエクスポート定義。
+;
+; generate_image だけは proxy.c 内の自前実装 (__declspec(dllexport)) を
+; エクスポートしてフックする。それ以外のシンボルはすべて
+; "名前=stable-diffusion-real.名前" 形式のフォワーダとして宣言し、
+; リンカがインポートライブラリを介さずに本物の DLL
+; (stable-diffusion-real.dll) の同名関数へ呼び出しを丸ごと転送する。
+; これによりゲーム側は API 互換のまま、generate_image のみ差し替えられる。
+;
+; 注意: フォワード先の stable-diffusion-real.dll をゲームルート直下に
+; 置いておくこと。無いとこれらのエクスポートは解決できずロードに失敗する。
+EXPORTS
+convert=stable-diffusion-real.convert
+free_sd_ctx=stable-diffusion-real.free_sd_ctx
+free_upscaler_ctx=stable-diffusion-real.free_upscaler_ctx
+generate_image
+generate_video=stable-diffusion-real.generate_video
+get_num_physical_cores=stable-diffusion-real.get_num_physical_cores
+new_sd_ctx=stable-diffusion-real.new_sd_ctx
+new_upscaler_ctx=stable-diffusion-real.new_upscaler_ctx
+preprocess_canny=stable-diffusion-real.preprocess_canny
+sd_ctx_params_init=stable-diffusion-real.sd_ctx_params_init
+sd_ctx_params_to_str=stable-diffusion-real.sd_ctx_params_to_str
+sd_get_system_info=stable-diffusion-real.sd_get_system_info
+sd_img_gen_params_init=stable-diffusion-real.sd_img_gen_params_init
+sd_img_gen_params_to_str=stable-diffusion-real.sd_img_gen_params_to_str
+sd_rng_type_name=stable-diffusion-real.sd_rng_type_name
+sd_sample_method_name=stable-diffusion-real.sd_sample_method_name
+sd_sample_params_init=stable-diffusion-real.sd_sample_params_init
+sd_sample_params_to_str=stable-diffusion-real.sd_sample_params_to_str
+sd_schedule_name=stable-diffusion-real.sd_schedule_name
+sd_set_log_callback=stable-diffusion-real.sd_set_log_callback
+sd_set_progress_callback=stable-diffusion-real.sd_set_progress_callback
+sd_type_name=stable-diffusion-real.sd_type_name
+sd_vid_gen_params_init=stable-diffusion-real.sd_vid_gen_params_init
+str_to_rng_type=stable-diffusion-real.str_to_rng_type
+str_to_sample_method=stable-diffusion-real.str_to_sample_method
+str_to_schedule=stable-diffusion-real.str_to_schedule
+str_to_sd_type=stable-diffusion-real.str_to_sd_type
+upscale=stable-diffusion-real.upscale
