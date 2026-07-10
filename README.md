@@ -23,7 +23,7 @@
 
 ## 動作の仕組み
 
-ゲーム本体は Nuitka コンパイル済みで改変できないため、画像生成が呼び出す `sdcpp_cuda\lib\stable-diffusion.dll` を**自作プロキシ DLL に差し替えてフック**します。プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（`stable-diffusion-real.dll` として退避）へ転送します。動作ログはゲームルートの `proxy_resize.log` に出力されます。
+画像生成が呼び出す `sdcpp_cuda\lib\stable-diffusion.dll` を**自作プロキシ DLL に差し替えてフック**します。プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（`stable-diffusion-real.dll` として退避）へ転送します。動作ログはゲームルートの `proxy_resize.log` に出力されます。
 
 ---
 
