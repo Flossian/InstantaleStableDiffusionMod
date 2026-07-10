@@ -1,7 +1,9 @@
 ﻿# ==========================================================================
 #  Instantale SD MOD 設定 GUI  (sd_upscale.ini エディタ)
 #  sd_upscale_gui.bat から起動します。ini のコメント行はそのまま保持し、
-#  値の行だけを書き換えます。保存後、次の画像生成から反映されます
+#  値の行だけを書き換えます。自由記載欄の「有効」チェックを外すと、内容を
+#  ";off: key = value" 形式のコメントとして保存します (プロキシは無視するが
+#  GUI は次回オフ状態で復元する)。保存後、次の画像生成から反映されます
 #  (ゲームの再起動は不要 -- プロキシ DLL が生成のたびに ini を読み直すため)。
 #  このファイルは UTF-8 (BOM 付き) で保存すること (Windows PowerShell 5.1 対応)。
 # ==========================================================================
@@ -14,19 +16,23 @@ if (-not ('SdGui.MapEntry' -as [type])) {
     Add-Type -TypeDefinition @"
 namespace SdGui {
     public class MapEntry {
+        public bool   Enabled { get; set; }
         public string Name   { get; set; }
         public string Target { get; set; }
-        public MapEntry() { Name = ""; Target = ""; }
+        public MapEntry() { Enabled = true; Name = ""; Target = ""; }
     }
     public class RuleEntry {
+        public bool   Enabled { get; set; }
         public string Name { get; set; }
         public string Cls  { get; set; }
         public string Cond { get; set; }
         public string Add  { get; set; }
-        public RuleEntry() { Name = ""; Cls = "portrait"; Cond = ""; Add = ""; }
+        public RuleEntry() { Enabled = true; Name = ""; Cls = "portrait"; Cond = ""; Add = ""; }
     }
 }
 "@
+} elseif (-not [SdGui.MapEntry].GetProperty('Enabled')) {
+    throw '古い SdGui 型が読み込まれた PowerShell セッションです。新しいウィンドウから起動し直してください。'
 }
 
 # ---------------------------------------------------------------- ini 解析
@@ -61,9 +67,23 @@ function Confirm-Section($lines, [string]$name) {
     return @{ Start = $lines.Count; End = $lines.Count }
 }
 
+# GUI のチェックボックスで無効化された値は ";off: key = value" 形式のコメント
+# として保存する (プロキシは無視するが、GUI は次回起動時にオフ状態で復元する)。
+
+# セクション内の ";off: key =" 無効化行をすべて削除する
+function Remove-DisabledKey($lines, [string]$section, [string]$key) {
+    $r = Find-Section $lines $section
+    if (-not $r) { return }
+    $rx = '^\s*;off:\s*' + [regex]::Escape($key) + '\s*='
+    for ($i = $r.End - 1; $i -ge $r.Start; $i--) {
+        if ($lines[$i] -match $rx) { $lines.RemoveAt($i) }
+    }
+}
+
 # セクション内で key= の有効行を探し、最後の 1 行を書き換える (残りはコメント化)。
 # 無ければセクション末尾に追加する。コメント行 (記入例など) には触らない。
 function Set-IniKey($lines, [string]$section, [string]$key, [string]$value) {
+    Remove-DisabledKey $lines $section $key
     $r = Confirm-Section $lines $section
     $rx = '^\s*' + [regex]::Escape($key) + '\s*='
     $hits = @()
@@ -80,8 +100,31 @@ function Set-IniKey($lines, [string]$section, [string]$key, [string]$value) {
     }
 }
 
-# key= の有効行をコメント化する (デフォルトに戻す)。セクションが無ければ何もしない。
+# key を無効化状態で保存する: 有効行の最後の 1 行を ";off:" 行に置き換え、
+# 残りの有効行はコメント化する。有効行が無ければセクション末尾に追加する。
+function Set-IniKeyDisabled($lines, [string]$section, [string]$key, [string]$value) {
+    Remove-DisabledKey $lines $section $key
+    $r = Confirm-Section $lines $section
+    $rx = '^\s*' + [regex]::Escape($key) + '\s*='
+    $hits = @()
+    for ($i = $r.Start; $i -lt $r.End; $i++) {
+        if ((Test-ActiveLine $lines[$i]) -and $lines[$i] -match $rx) { $hits += $i }
+    }
+    $newLine = ";off: $key = $value"
+    if ($hits.Count -gt 0) {
+        $lines[$hits[$hits.Count - 1]] = $newLine
+        for ($j = 0; $j -lt $hits.Count - 1; $j++) { $lines[$hits[$j]] = ';' + $lines[$hits[$j]] }
+    } else {
+        $ins = $r.End
+        while ($ins -gt $r.Start -and $lines[$ins - 1].Trim() -eq '') { $ins-- }
+        $lines.Insert($ins, $newLine)
+    }
+}
+
+# key= の有効行をコメント化する (デフォルトに戻す)。";off:" 行も削除する。
+# セクションが無ければ何もしない。
 function Clear-IniKey($lines, [string]$section, [string]$key) {
+    Remove-DisabledKey $lines $section $key
     $r = Find-Section $lines $section
     if (-not $r) { return }
     $rx = '^\s*' + [regex]::Escape($key) + '\s*='
@@ -90,12 +133,13 @@ function Clear-IniKey($lines, [string]$section, [string]$key) {
     }
 }
 
-# セクション内の有効行をすべて $newLines に置き換える (コメント行は保持)
+# セクション内の有効行と ";off:" 行をすべて $newLines に置き換える (その他の
+# コメント行は保持)
 function Set-DynamicSection($lines, [string]$section, [string[]]$newLines) {
     $r = Confirm-Section $lines $section
     $active = @()
     for ($i = $r.Start; $i -lt $r.End; $i++) {
-        if (Test-ActiveLine $lines[$i]) { $active += $i }
+        if ((Test-ActiveLine $lines[$i]) -or $lines[$i].TrimStart().StartsWith(';off:')) { $active += $i }
     }
     if ($active.Count -gt 0) {
         $insertAt = $active[0]
@@ -107,17 +151,24 @@ function Set-DynamicSection($lines, [string]$section, [string[]]$newLines) {
     foreach ($nl in $newLines) { $lines.Insert($insertAt, $nl); $insertAt++ }
 }
 
-# ini 全体を読み、有効な設定値を取り出す
+# ini 全体を読み、有効な設定値と ";off:" 無効化値を取り出す
 function Read-IniValues($lines) {
     $fx    = @{}
+    $dis   = @{}
     $map   = New-Object System.Collections.ArrayList
     $rules = New-Object System.Collections.ArrayList
     $sec = ''
     foreach ($line in $lines) {
         $t = $line.Trim()
-        if ($t -eq '' -or $t[0] -eq ';' -or $t[0] -eq '#') { continue }
+        if ($t -eq '') { continue }
+        $enabled = $true
+        if ($t.StartsWith(';off:')) {           # GUI で無効化された値 (コメント扱い)
+            $t = $t.Substring(5).Trim()
+            if ($t -eq '') { continue }
+            $enabled = $false
+        } elseif ($t[0] -eq ';' -or $t[0] -eq '#') { continue }
         if ($t[0] -eq '[') {
-            if ($t -match '^\[(.+)\]') { $sec = $Matches[1].Trim().ToLower() }
+            if ($enabled -and $t -match '^\[(.+)\]') { $sec = $Matches[1].Trim().ToLower() }
             continue
         }
         $eq = $t.IndexOf('=')
@@ -126,17 +177,19 @@ function Read-IniValues($lines) {
         $val = $t.Substring($eq + 1).Trim()
         if ($key -eq '') { continue }
         if ($sec -eq 'lora_map') {
-            [void]$map.Add(@{ Name = $key; Target = $val })
+            [void]$map.Add(@{ Name = $key; Target = $val; Enabled = $enabled })
         } elseif ($sec -eq 'lora_add_if') {
             $parts = $val -split '\|', 3
             if ($parts.Count -eq 3) {
-                [void]$rules.Add(@{ Name = $key; Cls = $parts[0].Trim(); Cond = $parts[1].Trim(); Add = $parts[2].Trim() })
+                [void]$rules.Add(@{ Name = $key; Cls = $parts[0].Trim(); Cond = $parts[1].Trim(); Add = $parts[2].Trim(); Enabled = $enabled })
             }
-        } else {
+        } elseif ($enabled) {
             $fx["$sec/$($key.ToLower())"] = $val   # 後勝ち (プロキシと同じ)
+        } else {
+            $dis["$sec/$($key.ToLower())"] = $val
         }
     }
-    return @{ Fx = $fx; Map = $map; Rules = $rules }
+    return @{ Fx = $fx; Dis = $dis; Map = $map; Rules = $rules }
 }
 
 # ------------------------------------------------------------------- 画面
@@ -219,22 +272,26 @@ $xaml = @'
             <GroupBox Header="特定プロンプトのスキップ (一致した生成はアップスケールしない)" Padding="8">
               <StackPanel>
                 <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,6"
-                  Text="語を「/」区切りで複数指定、どれか 1 つ含まれれば成立。先頭に ! を付けた語は「含まれない」ことが条件 (すべて必須)。単語境界つき・大文字小文字不問。例: pixel art/sprite"/>
+                  Text="語を「/」区切りで複数指定、どれか 1 つ含まれれば成立。先頭に ! を付けた語は「含まれない」ことが条件 (すべて必須)。単語境界つき・大文字小文字不問。例: pixel art/sprite。「有効」のチェックを外すと、内容を残したまま無効化できます。"/>
                 <Grid>
                   <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                   </Grid.ColumnDefinitions>
                   <Grid.RowDefinitions>
                     <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
                   </Grid.RowDefinitions>
                   <TextBlock Text="全種類共通:" VerticalAlignment="Center"/>
                   <TextBox Name="TxtSkipAny" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                  <CheckBox Name="ChkSkipAny" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                   <TextBlock Text="portrait のみ:" Grid.Row="1" VerticalAlignment="Center"/>
                   <TextBox Name="TxtSkipP" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                  <CheckBox Name="ChkSkipP" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                   <TextBlock Text="landscape のみ:" Grid.Row="2" VerticalAlignment="Center"/>
                   <TextBox Name="TxtSkipL" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                  <CheckBox Name="ChkSkipL" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                   <TextBlock Text="square のみ:" Grid.Row="3" VerticalAlignment="Center"/>
                   <TextBox Name="TxtSkipS" Grid.Row="3" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                  <CheckBox Name="ChkSkipS" Content="有効" Grid.Row="3" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 </Grid>
               </StackPanel>
             </GroupBox>
@@ -246,7 +303,7 @@ $xaml = @'
       <TabItem Header=" LoRA 付替 ">
         <DockPanel Margin="12">
           <TextBlock DockPanel.Dock="Top" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"
-            Text="[lora_map] ゲームが要求する LoRA の付け替え / 無効化。実ファイル名は拡張子 .safetensors 不要、「:強度」を付けられます (例: LCM_LoRA_SDXL:1.0)。「off」でその LoRA を適用しません。SDXL モデル使用中は SD1.5 用 LoRA を必ず off にすること (クラッシュ防止)。"/>
+            Text="[lora_map] ゲームが要求する LoRA の付け替え / 無効化。実ファイル名は拡張子 .safetensors 不要、「:強度」を付けられます (例: LCM_LoRA_SDXL:1.0)。「off」でその LoRA を適用しません。SDXL モデル使用中は SD1.5 用 LoRA を必ず off にすること (クラッシュ防止)。「有効」のチェックを外した行は、内容を残したまま無効化されます。"/>
           <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
             <Button Name="BtnMapAdd" Content="行を追加" Width="100" Padding="0,4" Margin="0,0,8,0"/>
             <Button Name="BtnMapDel" Content="選択行を削除" Width="110" Padding="0,4"/>
@@ -254,6 +311,7 @@ $xaml = @'
           <DataGrid Name="GridLoraMap" AutoGenerateColumns="False" CanUserAddRows="False"
                     HeadersVisibility="Column" RowHeight="26">
             <DataGrid.Columns>
+              <DataGridCheckBoxColumn Header="有効" Binding="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}" Width="46"/>
               <DataGridTextColumn Header="ゲーム内の名前" Binding="{Binding Name}" Width="2*"/>
               <DataGridTextColumn Header="実ファイル名[:強度] / off" Binding="{Binding Target}" Width="3*"/>
             </DataGrid.Columns>
@@ -266,33 +324,39 @@ $xaml = @'
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="12">
             <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"
-              Text="画像の種類ごとに (ネガティブ) プロンプトの末尾へ追加します。&lt;lora:ファイル名:強度&gt; の LoRA タグも、普通のタグも書けます。空欄 = 追加しない。"/>
+              Text="画像の種類ごとに (ネガティブ) プロンプトの末尾へ追加します。&lt;lora:ファイル名:強度&gt; の LoRA タグも、普通のタグも書けます。空欄 = 追加しない。「有効」のチェックを外すと、内容を残したまま無効化できます。"/>
             <GroupBox Header="プロンプトへ追加 [lora_add]" Padding="8" Margin="0,0,0,8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtAddP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkAddP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtAddL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkAddL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtAddS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkAddS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
             <GroupBox Header="ネガティブプロンプトへ追加 [negative_add]" Padding="8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegAddP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegAddP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegAddL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegAddL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegAddS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegAddS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
           </StackPanel>
@@ -303,7 +367,7 @@ $xaml = @'
       <TabItem Header=" 条件付き追加 ">
         <DockPanel Margin="12">
           <TextBlock DockPanel.Dock="Top" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"
-            Text="[lora_add_if] ゲーム本来のプロンプトに特定の語を含む場合だけ末尾へ追記します (男女で LoRA 切替など)。クラスは portrait / landscape / square / any。条件は「/」区切りでどれか 1 つ含まれれば成立、!語 は「含まれない」ことが条件。例:  1boy/male/man  →  &lt;lora:maleStyle:0.8&gt;"/>
+            Text="[lora_add_if] ゲーム本来のプロンプトに特定の語を含む場合だけ末尾へ追記します (男女で LoRA 切替など)。クラスは portrait / landscape / square / any。条件は「/」区切りでどれか 1 つ含まれれば成立、!語 は「含まれない」ことが条件。例:  1boy/male/man  →  &lt;lora:maleStyle:0.8&gt;。「有効」のチェックを外した行は、内容を残したまま無効化されます。"/>
           <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
             <Button Name="BtnRuleAdd" Content="行を追加" Width="100" Padding="0,4" Margin="0,0,8,0"/>
             <Button Name="BtnRuleDel" Content="選択行を削除" Width="110" Padding="0,4"/>
@@ -311,6 +375,7 @@ $xaml = @'
           <DataGrid Name="GridRules" AutoGenerateColumns="False" CanUserAddRows="False"
                     HeadersVisibility="Column" RowHeight="26">
             <DataGrid.Columns>
+              <DataGridCheckBoxColumn Header="有効" Binding="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}" Width="46"/>
               <DataGridTextColumn Header="ルール名 (任意)" Binding="{Binding Name}" Width="*"/>
               <DataGridTextColumn Header="クラス" Binding="{Binding Cls}" Width="*"/>
               <DataGridTextColumn Header="条件 (語1/語2/!語3)" Binding="{Binding Cond}" Width="2*"/>
@@ -325,33 +390,39 @@ $xaml = @'
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="12">
             <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"
-              Text="ゲームの (ネガティブ) プロンプトから、カンマ区切りで指定したタグを取り除きます。1 区画単位・大文字小文字不問の完全一致 (watercolor と書いても watercolor painting は消えません)。例: medieval, dark fantasy, watercolor"/>
+              Text="ゲームの (ネガティブ) プロンプトから、カンマ区切りで指定したタグを取り除きます。1 区画単位・大文字小文字不問の完全一致 (watercolor と書いても watercolor painting は消えません)。例: medieval, dark fantasy, watercolor。「有効」のチェックを外すと、内容を残したまま無効化できます。"/>
             <GroupBox Header="プロンプトから除去 [prompt_remove]" Padding="8" Margin="0,0,0,8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRmP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRmP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRmL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRmL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRmS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRmS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
             <GroupBox Header="ネガティブプロンプトから除去 [negative_remove]" Padding="8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRmP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRmP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRmL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRmL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRmS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRmS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
           </StackPanel>
@@ -363,33 +434,39 @@ $xaml = @'
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="12">
             <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"
-              Text="記入したクラスは (ネガティブ) プロンプトが丸ごとここの内容になります。{prompt} と書いた位置にゲーム本来のプロンプトが埋め込まれます。{prompt} 無しだと毎回ほぼ同じ絵になるので注意。空欄 = 置換しない。例: 1girl, solo, {prompt}, masterpiece, best quality"/>
+              Text="記入したクラスは (ネガティブ) プロンプトが丸ごとここの内容になります。{prompt} と書いた位置にゲーム本来のプロンプトが埋め込まれます。{prompt} 無しだと毎回ほぼ同じ絵になるので注意。空欄 = 置換しない。例: 1girl, solo, {prompt}, masterpiece, best quality。「有効」のチェックを外すと、内容を残したまま無効化できます。"/>
             <GroupBox Header="プロンプトの置き換え [prompt_replace]" Padding="8" Margin="0,0,0,8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRpP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRpP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRpL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRpL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtRpS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkRpS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
             <GroupBox Header="ネガティブプロンプトの置き換え [negative_replace]" Padding="8">
               <Grid>
                 <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="130"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
                 <TextBlock Text="portrait (キャラ):" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRpP" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRpP" Content="有効" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="landscape (背景):" Grid.Row="1" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRpL" Grid.Row="1" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRpL" Content="有効" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
                 <TextBlock Text="square (その他):" Grid.Row="2" VerticalAlignment="Center"/>
                 <TextBox Name="TxtNegRpS" Grid.Row="2" Grid.Column="1" Margin="0,2" VerticalContentAlignment="Center"/>
+                <CheckBox Name="ChkNegRpS" Content="有効" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </GroupBox>
           </StackPanel>
@@ -474,11 +551,15 @@ $names = @(
     'ChkEnabled','TxtGoalShort','TxtMaxLong','TxtRound','TxtGoalShortLand','TxtMaxLongLand',
     'ChkEnPortrait','ChkEnLandscape','ChkEnSquare',
     'TxtSkipAny','TxtSkipP','TxtSkipL','TxtSkipS',
+    'ChkSkipAny','ChkSkipP','ChkSkipL','ChkSkipS',
     'GridLoraMap','BtnMapAdd','BtnMapDel',
     'TxtAddP','TxtAddL','TxtAddS','TxtNegAddP','TxtNegAddL','TxtNegAddS',
+    'ChkAddP','ChkAddL','ChkAddS','ChkNegAddP','ChkNegAddL','ChkNegAddS',
     'GridRules','BtnRuleAdd','BtnRuleDel',
     'TxtRmP','TxtRmL','TxtRmS','TxtNegRmP','TxtNegRmL','TxtNegRmS',
+    'ChkRmP','ChkRmL','ChkRmS','ChkNegRmP','ChkNegRmL','ChkNegRmS',
     'TxtRpP','TxtRpL','TxtRpS','TxtNegRpP','TxtNegRpL','TxtNegRpS',
+    'ChkRpP','ChkRpL','ChkRpS','ChkNegRpP','ChkNegRpL','ChkNegRpS',
     'CmbMethodP','CmbSchedP','TxtStepsP','TxtCfgP',
     'CmbMethodL','CmbSchedL','TxtStepsL','TxtCfgL',
     'CmbMethodS','CmbSchedS','TxtStepsS','TxtCfgS',
@@ -504,9 +585,16 @@ $script:Lines   = $null
 # ------------------------------------------------------- 読み込み → 画面へ
 
 function Update-Controls($parsed) {
-    $fx = $parsed.Fx
+    $fx  = $parsed.Fx
+    $dis = $parsed.Dis
     function V([string]$key, [string]$def = '') {
         if ($fx.ContainsKey($key)) { return $fx[$key] } else { return $def }
+    }
+    # テキスト欄と「有効」チェックの組を読み込む (";off:" 行はオフ状態で復元)
+    function LoadPair([string]$txt, [string]$chk, [string]$key) {
+        if ($fx.ContainsKey($key))      { $c[$txt].Text = $fx[$key];  $c[$chk].IsChecked = $true }
+        elseif ($dis.ContainsKey($key)) { $c[$txt].Text = $dis[$key]; $c[$chk].IsChecked = $false }
+        else                            { $c[$txt].Text = '';         $c[$chk].IsChecked = $true }
     }
     $c['ChkEnabled'].IsChecked      = ((V 'upscale/enabled' '1') -ne '0')
     $c['TxtGoalShort'].Text         = V 'upscale/goal_short'
@@ -517,17 +605,17 @@ function Update-Controls($parsed) {
     $c['ChkEnPortrait'].IsChecked   = ((V 'upscale/enabled_portrait'  '1') -ne '0')
     $c['ChkEnLandscape'].IsChecked  = ((V 'upscale/enabled_landscape' '1') -ne '0')
     $c['ChkEnSquare'].IsChecked     = ((V 'upscale/enabled_square'    '1') -ne '0')
-    $c['TxtSkipAny'].Text           = V 'upscale/skip_if'
-    $c['TxtSkipP'].Text             = V 'upscale/skip_if_portrait'
-    $c['TxtSkipL'].Text             = V 'upscale/skip_if_landscape'
-    $c['TxtSkipS'].Text             = V 'upscale/skip_if_square'
+    LoadPair 'TxtSkipAny' 'ChkSkipAny' 'upscale/skip_if'
+    LoadPair 'TxtSkipP'   'ChkSkipP'   'upscale/skip_if_portrait'
+    LoadPair 'TxtSkipL'   'ChkSkipL'   'upscale/skip_if_landscape'
+    LoadPair 'TxtSkipS'   'ChkSkipS'   'upscale/skip_if_square'
 
-    $c['TxtAddP'].Text    = V 'lora_add/portrait';        $c['TxtAddL'].Text    = V 'lora_add/landscape';        $c['TxtAddS'].Text    = V 'lora_add/square'
-    $c['TxtNegAddP'].Text = V 'negative_add/portrait';    $c['TxtNegAddL'].Text = V 'negative_add/landscape';    $c['TxtNegAddS'].Text = V 'negative_add/square'
-    $c['TxtRmP'].Text     = V 'prompt_remove/portrait';   $c['TxtRmL'].Text     = V 'prompt_remove/landscape';   $c['TxtRmS'].Text     = V 'prompt_remove/square'
-    $c['TxtNegRmP'].Text  = V 'negative_remove/portrait'; $c['TxtNegRmL'].Text  = V 'negative_remove/landscape'; $c['TxtNegRmS'].Text  = V 'negative_remove/square'
-    $c['TxtRpP'].Text     = V 'prompt_replace/portrait';  $c['TxtRpL'].Text     = V 'prompt_replace/landscape';  $c['TxtRpS'].Text     = V 'prompt_replace/square'
-    $c['TxtNegRpP'].Text  = V 'negative_replace/portrait'; $c['TxtNegRpL'].Text = V 'negative_replace/landscape'; $c['TxtNegRpS'].Text = V 'negative_replace/square'
+    LoadPair 'TxtAddP'    'ChkAddP'    'lora_add/portrait';        LoadPair 'TxtAddL'    'ChkAddL'    'lora_add/landscape';        LoadPair 'TxtAddS'    'ChkAddS'    'lora_add/square'
+    LoadPair 'TxtNegAddP' 'ChkNegAddP' 'negative_add/portrait';    LoadPair 'TxtNegAddL' 'ChkNegAddL' 'negative_add/landscape';    LoadPair 'TxtNegAddS' 'ChkNegAddS' 'negative_add/square'
+    LoadPair 'TxtRmP'     'ChkRmP'     'prompt_remove/portrait';   LoadPair 'TxtRmL'     'ChkRmL'     'prompt_remove/landscape';   LoadPair 'TxtRmS'     'ChkRmS'     'prompt_remove/square'
+    LoadPair 'TxtNegRmP'  'ChkNegRmP'  'negative_remove/portrait'; LoadPair 'TxtNegRmL'  'ChkNegRmL'  'negative_remove/landscape'; LoadPair 'TxtNegRmS'  'ChkNegRmS'  'negative_remove/square'
+    LoadPair 'TxtRpP'     'ChkRpP'     'prompt_replace/portrait';  LoadPair 'TxtRpL'     'ChkRpL'     'prompt_replace/landscape';  LoadPair 'TxtRpS'     'ChkRpS'     'prompt_replace/square'
+    LoadPair 'TxtNegRpP'  'ChkNegRpP'  'negative_replace/portrait'; LoadPair 'TxtNegRpL' 'ChkNegRpL'  'negative_replace/landscape'; LoadPair 'TxtNegRpS' 'ChkNegRpS'  'negative_replace/square'
 
     $c['CmbMethodP'].Text = V 'sampler/portrait_method';  $c['CmbSchedP'].Text = V 'sampler/portrait_scheduler'
     $c['TxtStepsP'].Text  = V 'sampler/portrait_steps';   $c['TxtCfgP'].Text   = V 'sampler/portrait_cfg'
@@ -538,12 +626,12 @@ function Update-Controls($parsed) {
 
     $script:MapColl.Clear()
     foreach ($m in $parsed.Map) {
-        $e = New-Object SdGui.MapEntry; $e.Name = $m.Name; $e.Target = $m.Target
+        $e = New-Object SdGui.MapEntry; $e.Name = $m.Name; $e.Target = $m.Target; $e.Enabled = [bool]$m.Enabled
         $script:MapColl.Add($e)
     }
     $script:RuleColl.Clear()
     foreach ($r in $parsed.Rules) {
-        $e = New-Object SdGui.RuleEntry; $e.Name = $r.Name; $e.Cls = $r.Cls; $e.Cond = $r.Cond; $e.Add = $r.Add
+        $e = New-Object SdGui.RuleEntry; $e.Name = $r.Name; $e.Cls = $r.Cls; $e.Cond = $r.Cond; $e.Add = $r.Add; $e.Enabled = [bool]$r.Enabled
         $script:RuleColl.Add($e)
     }
 }
@@ -586,6 +674,14 @@ function Get-FloatField($tb, [string]$label, [double]$min, [double]$max) {
 function Set-OrClear($lines, [string]$section, [string]$key, [string]$value) {
     if ([string]::IsNullOrWhiteSpace($value)) { Clear-IniKey $lines $section $key }
     else { Set-IniKey $lines $section $key $value.Trim() }
+}
+
+# 「有効」チェック付きの欄: 空ならコメント化、チェックありは通常書き込み、
+# チェックなしは ";off:" 行として内容を保存する
+function Set-OrClearChk($lines, [string]$section, [string]$key, [string]$value, [bool]$enabled) {
+    if ([string]::IsNullOrWhiteSpace($value)) { Clear-IniKey $lines $section $key }
+    elseif ($enabled) { Set-IniKey $lines $section $key $value.Trim() }
+    else { Set-IniKeyDisabled $lines $section $key $value.Trim() }
 }
 
 function Save-IniFile {
@@ -631,13 +727,17 @@ function Save-IniFile {
             if ([string]::IsNullOrWhiteSpace($r.Cond) -or [string]::IsNullOrWhiteSpace($r.Add)) {
                 throw "条件付き追加「$($r.Name)」: 条件と追加内容の両方を入力してください"
             }
-            $ruleLines += "$($r.Name.Trim()) = $cls | $($r.Cond.Trim()) | $($r.Add.Trim())"
+            $rl = "$($r.Name.Trim()) = $cls | $($r.Cond.Trim()) | $($r.Add.Trim())"
+            if (-not $r.Enabled) { $rl = ";off: $rl" }
+            $ruleLines += $rl
         }
 
         $mapLines = @()
         foreach ($m in $script:MapColl) {
             if ([string]::IsNullOrWhiteSpace($m.Name)) { continue }
-            $mapLines += "$($m.Name.Trim()) = $($m.Target.Trim())"
+            $ml = "$($m.Name.Trim()) = $($m.Target.Trim())"
+            if (-not $m.Enabled) { $ml = ";off: $ml" }
+            $mapLines += $ml
         }
 
         # --- 書き込み ---
@@ -659,32 +759,35 @@ function Save-IniFile {
             else { Set-IniKey $lines 'upscale' $p.K '0' }
         }
 
-        Set-OrClear $lines 'upscale' 'skip_if'           $c['TxtSkipAny'].Text
-        Set-OrClear $lines 'upscale' 'skip_if_portrait'  $c['TxtSkipP'].Text
-        Set-OrClear $lines 'upscale' 'skip_if_landscape' $c['TxtSkipL'].Text
-        Set-OrClear $lines 'upscale' 'skip_if_square'    $c['TxtSkipS'].Text
-
         Set-DynamicSection $lines 'lora_map'    $mapLines
         Set-DynamicSection $lines 'lora_add_if' $ruleLines
 
-        Set-OrClear $lines 'lora_add' 'portrait'  $c['TxtAddP'].Text
-        Set-OrClear $lines 'lora_add' 'landscape' $c['TxtAddL'].Text
-        Set-OrClear $lines 'lora_add' 'square'    $c['TxtAddS'].Text
-        Set-OrClear $lines 'negative_add' 'portrait'  $c['TxtNegAddP'].Text
-        Set-OrClear $lines 'negative_add' 'landscape' $c['TxtNegAddL'].Text
-        Set-OrClear $lines 'negative_add' 'square'    $c['TxtNegAddS'].Text
-        Set-OrClear $lines 'prompt_remove' 'portrait'  $c['TxtRmP'].Text
-        Set-OrClear $lines 'prompt_remove' 'landscape' $c['TxtRmL'].Text
-        Set-OrClear $lines 'prompt_remove' 'square'    $c['TxtRmS'].Text
-        Set-OrClear $lines 'negative_remove' 'portrait'  $c['TxtNegRmP'].Text
-        Set-OrClear $lines 'negative_remove' 'landscape' $c['TxtNegRmL'].Text
-        Set-OrClear $lines 'negative_remove' 'square'    $c['TxtNegRmS'].Text
-        Set-OrClear $lines 'prompt_replace' 'portrait'  $c['TxtRpP'].Text
-        Set-OrClear $lines 'prompt_replace' 'landscape' $c['TxtRpL'].Text
-        Set-OrClear $lines 'prompt_replace' 'square'    $c['TxtRpS'].Text
-        Set-OrClear $lines 'negative_replace' 'portrait'  $c['TxtNegRpP'].Text
-        Set-OrClear $lines 'negative_replace' 'landscape' $c['TxtNegRpL'].Text
-        Set-OrClear $lines 'negative_replace' 'square'    $c['TxtNegRpS'].Text
+        # 「有効」チェック付きの自由記載欄 (S=セクション, K=キー, T=テキスト, C=チェック)
+        foreach ($f in @(
+                @{ S = 'upscale';          K = 'skip_if';           T = 'TxtSkipAny'; C = 'ChkSkipAny' },
+                @{ S = 'upscale';          K = 'skip_if_portrait';  T = 'TxtSkipP';   C = 'ChkSkipP' },
+                @{ S = 'upscale';          K = 'skip_if_landscape'; T = 'TxtSkipL';   C = 'ChkSkipL' },
+                @{ S = 'upscale';          K = 'skip_if_square';    T = 'TxtSkipS';   C = 'ChkSkipS' },
+                @{ S = 'lora_add';         K = 'portrait';  T = 'TxtAddP';    C = 'ChkAddP' },
+                @{ S = 'lora_add';         K = 'landscape'; T = 'TxtAddL';    C = 'ChkAddL' },
+                @{ S = 'lora_add';         K = 'square';    T = 'TxtAddS';    C = 'ChkAddS' },
+                @{ S = 'negative_add';     K = 'portrait';  T = 'TxtNegAddP'; C = 'ChkNegAddP' },
+                @{ S = 'negative_add';     K = 'landscape'; T = 'TxtNegAddL'; C = 'ChkNegAddL' },
+                @{ S = 'negative_add';     K = 'square';    T = 'TxtNegAddS'; C = 'ChkNegAddS' },
+                @{ S = 'prompt_remove';    K = 'portrait';  T = 'TxtRmP';     C = 'ChkRmP' },
+                @{ S = 'prompt_remove';    K = 'landscape'; T = 'TxtRmL';     C = 'ChkRmL' },
+                @{ S = 'prompt_remove';    K = 'square';    T = 'TxtRmS';     C = 'ChkRmS' },
+                @{ S = 'negative_remove';  K = 'portrait';  T = 'TxtNegRmP';  C = 'ChkNegRmP' },
+                @{ S = 'negative_remove';  K = 'landscape'; T = 'TxtNegRmL';  C = 'ChkNegRmL' },
+                @{ S = 'negative_remove';  K = 'square';    T = 'TxtNegRmS';  C = 'ChkNegRmS' },
+                @{ S = 'prompt_replace';   K = 'portrait';  T = 'TxtRpP';     C = 'ChkRpP' },
+                @{ S = 'prompt_replace';   K = 'landscape'; T = 'TxtRpL';     C = 'ChkRpL' },
+                @{ S = 'prompt_replace';   K = 'square';    T = 'TxtRpS';     C = 'ChkRpS' },
+                @{ S = 'negative_replace'; K = 'portrait';  T = 'TxtNegRpP';  C = 'ChkNegRpP' },
+                @{ S = 'negative_replace'; K = 'landscape'; T = 'TxtNegRpL';  C = 'ChkNegRpL' },
+                @{ S = 'negative_replace'; K = 'square';    T = 'TxtNegRpS';  C = 'ChkNegRpS' })) {
+            Set-OrClearChk $lines $f.S $f.K $c[$f.T].Text ([bool]$c[$f.C].IsChecked)
+        }
 
         foreach ($k in 'portrait', 'landscape', 'square') {
             Set-OrClear $lines 'sampler' "${k}_method"    $smp[$k].Method
@@ -749,7 +852,9 @@ if ($SelfTest) {
     $c['TxtGoalShort'].Text = '896'
     $c['ChkEnLandscape'].IsChecked = $false
     $c['TxtSkipAny'].Text = 'pixel art/sprite'
+    $c['TxtAddP'].Text = '<lora:testStyle:0.5>, masterpiece'; $c['ChkAddP'].IsChecked = $false
     $e = New-Object SdGui.MapEntry; $e.Name = 'TestLora'; $e.Target = 'off'; $script:MapColl.Add($e)
+    $e2 = New-Object SdGui.MapEntry; $e2.Name = 'PausedLora'; $e2.Target = 'myLora:0.7'; $e2.Enabled = $false; $script:MapColl.Add($e2)
     $r = New-Object SdGui.RuleEntry; $r.Name = 'rule1'; $r.Cls = 'portrait'; $r.Cond = '1boy'; $r.Add = '<lora:x:0.8>'
     $script:RuleColl.Add($r)
     $c['CmbMethodL'].Text = 'dpm++2m'; $c['CmbSchedL'].Text = 'karras'
@@ -765,8 +870,23 @@ if ($SelfTest) {
     if ($v.Fx['sampler/landscape_method'] -ne 'dpm++2m')  { $fail += 'landscape_method' }
     if ($v.Fx['sampler/landscape_cfg'] -ne '5')           { $fail += 'landscape_cfg' }
     if ($v.Fx['sampler/portrait_method'] -ne 'euler_a')   { $fail += 'portrait_method (既存値の保持)' }
-    if ($v.Map.Count -ne 1 -or $v.Map[0].Name -ne 'TestLora') { $fail += 'lora_map' }
+    if ($v.Map.Count -ne 2 -or $v.Map[0].Name -ne 'TestLora' -or -not $v.Map[0].Enabled) { $fail += 'lora_map' }
+    if ($v.Map.Count -eq 2 -and ($v.Map[1].Name -ne 'PausedLora' -or $v.Map[1].Target -ne 'myLora:0.7' -or $v.Map[1].Enabled)) { $fail += 'lora_map (無効行の保持)' }
     if ($v.Rules.Count -ne 1 -or $v.Rules[0].Cond -ne '1boy') { $fail += 'lora_add_if' }
+    if ($v.Fx.ContainsKey('lora_add/portrait'))                              { $fail += 'lora_add/portrait が有効のまま' }
+    if ($v.Dis['lora_add/portrait'] -ne '<lora:testStyle:0.5>, masterpiece') { $fail += 'lora_add/portrait (無効値の保持)' }
+    if ($c['ChkAddP'].IsChecked -or $c['TxtAddP'].Text -ne '<lora:testStyle:0.5>, masterpiece') { $fail += 'ChkAddP の復元' }
+
+    # 無効 → 有効に戻して保存し、通常の行として書かれることを確認
+    $c['ChkAddP'].IsChecked = $true
+    Save-IniFile
+    Open-IniFile $tmp
+    $v2 = Read-IniValues $script:Lines
+    if ($v2.Fx['lora_add/portrait'] -ne '<lora:testStyle:0.5>, masterpiece') { $fail += 'lora_add/portrait の再有効化' }
+    if ($v2.Dis.ContainsKey('lora_add/portrait'))                            { $fail += ';off: 行の残留' }
+    $c['ChkAddP'].IsChecked = $false
+    Save-IniFile
+    Open-IniFile $tmp
     $after = ([System.IO.File]::ReadAllLines($tmp, [System.Text.Encoding]::UTF8) |
         Where-Object { $_.TrimStart().StartsWith(';') }).Count
     if ($after -lt $before) { $fail += "コメント行が減った ($before -> $after)" }
