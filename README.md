@@ -23,7 +23,11 @@
 
 ## 動作の仕組み
 
-画像生成が呼び出す `sdcpp_<バックエンド>\lib\stable-diffusion.dll`（`sdcpp_cuda` / `sdcpp_cpu` / `sdcpp_vulkan` のうち存在するものすべて）を**自作プロキシ DLL に差し替えてフック**します。プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（同じ `lib\` 内に `stable-diffusion-real.dll` として退避）へ転送します。バックエンドごとにオリジナル DLL が異なるため、プロキシは自分と同じフォルダの退避 DLL を優先して読み込みます（無ければ v1 互換でゲームルート直下を参照）。動作ログはゲームルートの `proxy_resize.log` に出力されます。
+画像生成が呼び出す `sdcpp_<バックエンド>\lib\stable-diffusion.dll`（`sdcpp_cuda` / `sdcpp_cpu` / `sdcpp_vulkan` のうち存在するものすべて）を**自作プロキシ DLL に差し替えてフック**します。
+
+プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（同じ `lib\` 内に `stable-diffusion-real.dll` として退避）へ転送します。
+
+バックエンドごとにオリジナル DLL が異なるため、プロキシは自分と同じフォルダの退避 DLL を優先して読み込みます（無ければ v1 互換でゲームルート直下を参照）。動作ログはゲームルートの `proxy_resize.log` に出力されます。
 
 ---
 
@@ -77,6 +81,17 @@ switch_sd_mode.bat sdxl   SDXL モードへ強制
 | `[lora_add]` | 種類（portrait / landscape / square）別の LoRA・タグ追加 |
 | `[negative_add]` | 種類別のネガティブプロンプト追加 |
 | `[sampler]` | 種類別に method / steps / cfg / scheduler を上書き |
+
+### 解像度の決まり方（`[upscale]`）
+
+`goal_short`（短辺の目標）は「この値ちょうどにする」指定ではありません。アスペクト比を保ったまま拡大するため、先に長辺が `max_long` に達するとそこで拡大が止まります。
+
+```
+倍率 = min(goal_short ÷ 元の短辺, max_long ÷ 元の長辺)   ※ 1.0 未満にはならない (縮小しない)
+出力 = 元サイズ × 倍率 を、両辺とも round の倍数に四捨五入
+```
+
+例: キャラ画像 512×1024 に `goal_short=832` / `max_long=1216` を指定すると、短辺基準の 832÷512=1.625 より長辺上限の 1216÷1024=1.1875 が小さいためそちらが採用され、608×1216 → 丸めて **640×1216** になります（短辺は 832 に届きません）。短辺を実際に 832 にしたい場合は `max_long` も比例して上げてください（832/1664 → 出力 832×1664）。画像を歪めることはないため、元と異なる縦横比（832×1216 など）を直接指定することはできません。
 
 各項目の詳しい意味と推奨値は各 README を参照してください。`sd_upscale_gui.bat`（PowerShell 製 GUI）でフォーム編集もできます。
 
