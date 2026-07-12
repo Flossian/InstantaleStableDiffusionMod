@@ -8,15 +8,18 @@ rem  プロキシ DLL を導入し、標準の SD1.5 モデル向けに TAESD
 rem  デコーダと sd_upscale.ini を設定する。
 rem  ゲームを終了した状態で実行すること。何度実行しても安全。
 rem
+rem  プロキシは sdcpp_cuda / sdcpp_cpu / sdcpp_vulkan のうち存在する
+rem  すべてのバックエンドへ導入される。元の DLL は各バックエンドの
+rem  lib\stable-diffusion-real.dll として退避される。
+rem
 rem  SD1.5 モードでは何もダウンロードする必要はない。ゲームには
 rem  SD1.5 モデルとその SD1.5 用 TAESD デコーダが最初から同梱されている。
 rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set LIBDLL=sdcpp_cuda\lib\stable-diffusion.dll
-set REALDLL=stable-diffusion-real.dll
 set PROXYSRC=mod_files\stable-diffusion-proxy.dll
+set LEGACYREAL=stable-diffusion-real.dll
 set TAESD=runtime\models\sd15\taesd\diffusion_pytorch_model.safetensors
 set S15=mod_files\taesd_sd15.safetensors
 set INI=sd_upscale.sd15.ini
@@ -26,36 +29,21 @@ echo  Instantale MOD : SD1.5 モードをインストール
 echo ============================================
 echo.
 
-rem --- [1/3] プロキシ DLL ---
+rem --- [1/3] プロキシ DLL (存在するすべてのバックエンドへ導入) ---
 echo [1/3] プロキシ DLL
 if not exist "%PROXYSRC%" (
     echo    [エラー] %PROXYSRC% が見つかりません。先に zip 全体を展開してください。
     goto end
 )
-if not exist "%LIBDLL%" (
-    echo    [エラー] %LIBDLL% が見つかりません。ここはゲームフォルダですか?
+set FOUND=0
+set DONE=0
+for %%B in (sdcpp_cuda sdcpp_cpu sdcpp_vulkan) do call :proxy_one %%B
+if %FOUND%==0 (
+    echo    [エラー] sdcpp_cuda / sdcpp_cpu / sdcpp_vulkan のいずれにも
+    echo            lib\stable-diffusion.dll が見つかりません。ここはゲームフォルダですか?
     goto end
 )
-for %%F in ("%LIBDLL%") do set LIBSIZE=%%~zF
-if %LIBSIZE% GTR 10000000 (
-    if not exist "%REALDLL%" (
-        echo    [ok]   元の DLL を %REALDLL% へ保存中 ... 少し時間がかかります
-        copy /b /y "%LIBDLL%" "%REALDLL%" >nul
-    ) else (
-        echo    [ok]   %REALDLL% は既に存在します。そのまま使用します
-    )
-    copy /b /y "%PROXYSRC%" "%LIBDLL%" >nul
-    echo    [ok]   プロキシを導入しました
-) else (
-    if not exist "%REALDLL%" (
-        echo    [エラー] %LIBDLL% は既にプロキシですが %REALDLL% がありません。
-        echo            元の 489MB の stable-diffusion.dll を
-        echo            sdcpp_cuda\lib\ に戻してから再実行してください。
-        goto end
-    )
-    copy /b /y "%PROXYSRC%" "%LIBDLL%" >nul
-    echo    [ok]   プロキシを更新しました。元 DLL は %REALDLL% として保存済みです
-)
+if %DONE%==0 goto end
 echo.
 
 rem --- [2/3] TAESD デコーダ (SD1.5) ---
@@ -92,4 +80,44 @@ echo 完了しました。ゲームを起動し、ゲーム内で SD1.5 のチェックポイントを選んでく
 :end
 echo.
 pause
+exit /b 0
+
+rem ============================================================
+rem  サブルーチン: 1 つのバックエンド (%1 = フォルダ名) にプロキシを導入。
+rem  元の DLL は同じ lib\ 内へ stable-diffusion-real.dll として退避する。
+rem  (プロキシは自分と同じフォルダの stable-diffusion-real.dll を優先して
+rem   読み込み、無ければ旧版どおりゲームルート直下を参照する)
+rem ============================================================
+:proxy_one
+set B=%1
+set LIBDLL=%B%\lib\stable-diffusion.dll
+set REALDLL=%B%\lib\stable-diffusion-real.dll
+if not exist "%LIBDLL%" exit /b 0
+set FOUND=1
+for %%F in ("%LIBDLL%") do set LIBSIZE=%%~zF
+if %LIBSIZE% LEQ 10000000 goto po_proxy
+rem -- 元の DLL がまだ入っている --
+if exist "%REALDLL%" (
+    echo    [ok]   %B%: 退避済みの元 DLL が既にあります。そのまま使用します
+) else (
+    echo    [ok]   %B%: 元の DLL を lib\stable-diffusion-real.dll へ保存中 ... 少し時間がかかります
+    copy /b /y "%LIBDLL%" "%REALDLL%" >nul
+)
+goto po_install
+:po_proxy
+rem -- 既にプロキシが入っている: 退避済みの元 DLL を確認 --
+if exist "%REALDLL%" goto po_install
+if not "%B%"=="sdcpp_cuda" goto po_noreal
+if not exist "%LEGACYREAL%" goto po_noreal
+echo    [ok]   %B%: 旧版の退避先 ^(ルートの %LEGACYREAL%^) を元 DLL として使用します
+goto po_install
+:po_noreal
+echo    [エラー] %B%: lib\stable-diffusion.dll は既にプロキシですが、
+echo            退避された元 DLL ^(%REALDLL%^) がありません。
+echo            元の stable-diffusion.dll を %B%\lib\ に戻してから再実行してください。
+exit /b 0
+:po_install
+copy /b /y "%PROXYSRC%" "%LIBDLL%" >nul
+echo    [ok]   %B%: プロキシを導入しました
+set DONE=1
 exit /b 0

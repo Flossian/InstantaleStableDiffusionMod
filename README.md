@@ -3,7 +3,7 @@
 **Instantale** の画像生成をフックし、**生成解像度の引き上げ**・**LoRA の差し替え/追加適用**・**サンプラー上書き**（いずれもゲーム側では開放されていない機能）を可能にする MOD です。ゲーム標準の **SD1.5** のまま強化する SD1.5 モードと、**SDXL 系モデル**（Illustrious 等）へ置き換える SDXL モードに対応し、`switch_sd_mode.bat` で相互に切り替えられます。
 
 > [!WARNING]
-> 本 MOD はゲーム同梱ファイル（`sdcpp_cuda\lib\stable-diffusion.dll` と TAESD デコーダ）を書き換えます。導入は自己責任で行ってください。オリジナルは自動退避され、`switch_sd_mode.bat` / アンインストール手順で元に戻せます。
+> 本 MOD はゲーム同梱ファイル（`sdcpp_cuda` / `sdcpp_cpu` / `sdcpp_vulkan` 各バックエンドの `lib\stable-diffusion.dll` と TAESD デコーダ）を書き換えます。導入は自己責任で行ってください。オリジナルは自動退避され、`switch_sd_mode.bat` / アンインストール手順で元に戻せます。
 
 > [!CAUTION]
 > **SDXL への乗り換え、および LoRA の差し替え・追加適用は、意図しない異常な画像が生成される恐れがあります。** これらはゲーム本来の生成パイプラインを外れる機能であり、チェックポイントと LoRA・TAESD の系統（SD1.5 / SDXL）の不一致、解像度の上げすぎ、LoRA 同士の相性などによって、画像の破綻・崩れ・色化け、場合によってはゲームのクラッシュが起こり得ます。特に SD1.5 モデルへ SDXL 用 LoRA（またはその逆）を当てるとゲームごとクラッシュします。想定と異なる結果になった場合は、`[upscale]` を下げる・追加した LoRA を外す・`switch_sd_mode.bat` で元のモードへ戻す、などで切り分けてください。生成結果は保証されません。自己責任でご利用ください。
@@ -23,7 +23,7 @@
 
 ## 動作の仕組み
 
-画像生成が呼び出す `sdcpp_cuda\lib\stable-diffusion.dll` を**自作プロキシ DLL に差し替えてフック**します。プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（`stable-diffusion-real.dll` として退避）へ転送します。動作ログはゲームルートの `proxy_resize.log` に出力されます。
+画像生成が呼び出す `sdcpp_<バックエンド>\lib\stable-diffusion.dll`（`sdcpp_cuda` / `sdcpp_cpu` / `sdcpp_vulkan` のうち存在するものすべて）を**自作プロキシ DLL に差し替えてフック**します。プロキシは `generate_image` をフックして解像度とプロンプト（LoRA タグ）を書き換え、残り 27 個の export はオリジナル DLL（同じ `lib\` 内に `stable-diffusion-real.dll` として退避）へ転送します。バックエンドごとにオリジナル DLL が異なるため、プロキシは自分と同じフォルダの退避 DLL を優先して読み込みます（無ければ v1 互換でゲームルート直下を参照）。動作ログはゲームルートの `proxy_resize.log` に出力されます。
 
 ---
 
@@ -93,6 +93,7 @@ switch_sd_mode.bat sdxl   SDXL モードへ強制
 | `mod_files/stable-diffusion-proxy.dll` | プロキシ DLL（両モード共通、約 200KB） |
 | `mod_src/proxy.c` / `mod_src/exports.def` | プロキシ DLL のソースと転送定義 |
 | `README_SD15_MOD.txt` / `README_SDXL_MOD.txt` | モード別の詳細手順 |
+| `make_release_zip.bat` | 配布用 zip の作成（開発者用。`make_release_zip.bat v2` のようにバージョンを指定） |
 
 ---
 

@@ -42,7 +42,12 @@
  * 読み直される (ライブリロード、ゲーム再起動不要)。
  *
  * 他のエクスポートはすべて .def のフォワーダ経由で本物の DLL
- * (stable-diffusion-real.dll、ゲームルート直下に置くこと) へ転送される。
+ * (stable-diffusion-real.dll) へ転送される。本物の DLL はプロキシ自身と
+ * 同じフォルダ (sdcpp_cuda / sdcpp_cpu / sdcpp_vulkan の lib\) に置く。
+ * DllMain でフルパス指定で先にロードしておくことで、フォワーダの
+ * モジュール名解決 (ベース名一致) が正しいバックエンドの DLL に束縛される。
+ * 同じフォルダに無い場合は従来どおりゲームルート直下の
+ * stable-diffusion-real.dll へフォールバックする (v1 互換)。
  *
  * sd_img_gen_params_t のフィールドオフセット (同梱 DLL の
  * sd_img_gen_params_init/_to_str に対する probe2.exe のフリップテストで検証済):
@@ -57,6 +62,19 @@
  *   scheduler 列挙: 0=default 1=discrete 2=karras 3=exponential 4=ays 5=gits
  *     6=smoothstep
  */
+/* ======================= ファイル構成 (目次) =======================
+ * 上から順に:
+ *   1. 調整値・設定テーブル   ini から読み込むグローバル変数一式
+ *   2. 文字列ユーティリティ   大文字小文字不問の比較・トリム等の小物
+ *   3. 設定読み込み           load_config() = sd_upscale.ini のパース
+ *   4. 本物 DLL のロード      load_real_beside_proxy() / ensure_real()
+ *   5. 安全なメモリ検査       mem_readable() / str_readable() / prompt_ok()
+ *   6. プロンプト書き換え     remove_tags() / rewrite_prompt() など
+ *   7. 画像バッファ拡大       upscale() / fixup_image() (img2img 対応)
+ *   8. メインフック           generate_image() ← 全体の流れはここを読む
+ *   9. DllMain / 単体テスト
+ * ==================================================================== */
+
 #include <windows.h>
 #include <string.h>
 #include <stdlib.h>
@@ -82,6 +100,9 @@ static char g_skip_any[256];
 static char g_skip_cls[3][256];
 /* ----------------------------------------------------------------------------- */
 
+/* sd_img_gen_params_t 内の各フィールドのバイトオフセット (冒頭コメントの
+ * 検証済みレイアウト表に対応)。この構造体の定義はゲーム側にしか無いため、
+ * 構造体をバイト列として扱い rd_i32/wr_i32 等で直接読み書きする */
 #define OFF_PROMPT  0
 #define OFF_NEG     8
 #define OFF_CFG    96
@@ -128,11 +149,16 @@ static int   g_smp_steps[3];       /* 0  = 上書きしない */
 static float g_smp_cfg[3];         /* 0  = 上書きしない */
 static int   g_smp_state = 0;      /* 0=未確認, 1=検証済, -1=異常 (機能停止) */
 
+/* sample_method / scheduler の列挙値に対応する名前。ini の [sampler] で
+ * 指定する文字列であり、配列の添字がそのまま列挙値になる */
 static const char* METHOD_NAMES[] = { "euler_a", "euler", "heun", "dpm2", "dpm++2s_a",
     "dpm++2m", "dpm++2mv2", "ipndm", "ipndm_v", "lcm", "ddim_trailing", "tcd" };
 static const char* SCHED_NAMES[] = { "default", "discrete", "karras", "exponential",
     "ays", "gits", "smoothstep" };
 
+/* ---------------- 文字列ユーティリティ (前方宣言) ----------------
+ * いずれも ASCII の大文字小文字を無視して比較する。プロンプトのタグ照合が
+ * "Male" / "male" のような表記ゆれに左右されないようにするため */
 static int ci_eq(const char* a, const char* b);
 static int ci_eq_range(const char* a, const char* b, int n);
 static void trim_range(const char* s, const char* e, const char** ps, const char** pe);
@@ -153,16 +179,18 @@ static int name_to_enum(const char* name, const char** table, int n) {
     return -1;
 }
 
-typedef void* (*gen_fn)(void*, void*);
-typedef char* (*to_str_fn)(const void*);
+typedef void* (*gen_fn)(void*, void*);    /* generate_image と同じシグネチャ */
+typedef char* (*to_str_fn)(const void*);  /* sd_img_gen_params_to_str と同じ */
 
-static HMODULE   g_real = NULL;
-static gen_fn    real_generate_image = NULL;
-static to_str_fn real_params_to_str  = NULL;
-static FILE*     g_log = NULL;
-static int       g_calls = 0;
+static HMODULE   g_real = NULL;               /* 本物の stable-diffusion DLL */
+static gen_fn    real_generate_image = NULL;  /* 本物の generate_image */
+static to_str_fn real_params_to_str  = NULL;  /* レイアウト検証用 (prompt_ok が使う) */
+static FILE*     g_log = NULL;                /* proxy_resize.log のハンドル */
+static int       g_calls = 0;                 /* generate_image の呼び出し回数 */
 static int       g_prompt_state = 0;  /* 0=未確認, 1=検証済, -1=異常 (機能停止) */
 
+/* ゲームルート (= ゲームの作業ディレクトリ) の proxy_resize.log へ追記する。
+ * 初回呼び出し時にオープンし、開けなければ黙って何もしない */
 static void logf_(const char* fmt, ...) {
     if (!g_log) g_log = fopen("proxy_resize.log", "a");
     if (!g_log) return;
@@ -171,6 +199,8 @@ static void logf_(const char* fmt, ...) {
     fflush(g_log);
 }
 
+/* v を g_round の倍数へ四捨五入で丸める (SD 系は 64 の倍数を要求するため)。
+ * 最低でも 1 倍数分は確保する */
 static int snap(int v) {
     int rnd = g_round >= 8 ? g_round : 8;
     int r = ((v + rnd / 2) / rnd) * rnd;
@@ -178,6 +208,7 @@ static int snap(int v) {
     return r;
 }
 
+/* 文字列全体の一致判定 (大文字小文字不問)。一致なら 1 */
 static int ci_eq(const char* a, const char* b) {
     for (; *a && *b; a++, b++) {
         char ca = *a, cb = *b;
@@ -188,6 +219,8 @@ static int ci_eq(const char* a, const char* b) {
     return *a == *b;
 }
 
+/* a の先頭 n 文字が文字列 b 全体と一致するか (大文字小文字不問)。
+ * a は NUL 終端でなくてよい (プロンプト中の部分文字列を直接比較する用) */
 static int ci_eq_n(const char* a, const char* b, int n) {
     /* a は比較対象がちょうど n 文字。b は NUL 終端文字列 */
     for (int i = 0; i < n; i++) {
@@ -200,6 +233,7 @@ static int ci_eq_n(const char* a, const char* b, int n) {
     return b[n] == '\0';
 }
 
+/* s が pre で始まるか (大文字小文字不問)。始まっていれば 1 */
 static int ci_starts(const char* s, const char* pre) {
     for (; *pre; s++, pre++) {
         char ca = *s, cb = *pre;
@@ -230,6 +264,10 @@ static void load_config(void) {
     g_enabled_cls[0] = g_enabled_cls[1] = g_enabled_cls[2] = 1;
     memset(g_skip_any, 0, sizeof g_skip_any);
     memset(g_skip_cls, 0, sizeof g_skip_cls);
+    /* 以降は素朴な INI パーサ: 1 行ずつ読み、行頭空白を飛ばし、';' '#' 行は
+     * コメントとして無視。"[名前]" で現在のセクションを切り替え、
+     * "キー = 値" を切り出して前後の空白と改行を落としてから、
+     * セクションごとの分岐で対応するテーブル / 変数に格納していく */
     char line[1024];
     char section[64] = "";
     while (fgets(line, sizeof line, f)) {
@@ -344,23 +382,68 @@ static void load_config(void) {
     fclose(f);
 }
 
+/* プロキシ自身と同じフォルダにある本物 DLL のフルパス ("" = 無し) */
+static char g_realpath[1024];
+
+/* プロキシのロード時に、同じフォルダの stable-diffusion-real.dll を
+ * フルパスでロードしておく。バックエンド (cuda / cpu / vulkan) ごとに
+ * オリジナル DLL が異なるため、.def のフォワーダがベース名
+ * "stable-diffusion-real" を解決する際に、既にロード済みのこのモジュール
+ * (= 正しいバックエンドのもの) へ束縛されるようにするのが目的。
+ * LOAD_WITH_ALTERED_SEARCH_PATH により依存 DLL (cublas 等) も同じ lib\
+ * フォルダから解決される。ファイルが無ければ何もしない: フォワーダと
+ * ensure_real は従来どおりゲームルートの同名 DLL へフォールバックする。 */
+static void load_real_beside_proxy(HINSTANCE self) {
+    DWORD n = GetModuleFileNameA(self, g_realpath, sizeof g_realpath);
+    if (n == 0 || n >= sizeof g_realpath) { g_realpath[0] = '\0'; return; }
+    char* bs = strrchr(g_realpath, '\\');
+    char* fs = strrchr(g_realpath, '/');
+    char* slash = fs > bs ? fs : bs;
+    if (!slash) { g_realpath[0] = '\0'; return; }
+    static const char NAME[] = "stable-diffusion-real.dll";
+    size_t dir = (size_t)(slash + 1 - g_realpath);
+    if (dir + sizeof NAME > sizeof g_realpath) { g_realpath[0] = '\0'; return; }
+    memcpy(g_realpath + dir, NAME, sizeof NAME);
+    if (GetFileAttributesA(g_realpath) == INVALID_FILE_ATTRIBUTES) {
+        g_realpath[0] = '\0';
+        return;
+    }
+    g_real = LoadLibraryExA(g_realpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+
+/* 本物 DLL のハンドルとフックに必要な関数ポインタを (初回のみ) 解決する。
+ * 探す順序:
+ *   (1) ロード済みモジュール (通常は DllMain が先行ロードしたもの)
+ *   (2) プロキシと同じフォルダの stable-diffusion-real.dll (g_realpath)
+ *   (3) 通常の DLL 検索順 = ゲームルート直下 (v1 の旧配置)
+ * 失敗しても致命的にはせず、generate_image 側が素通し動作になる */
 static void ensure_real(void) {
     if (real_generate_image) return;
-    g_real = GetModuleHandleA("stable-diffusion-real.dll");
+    if (!g_real) g_real = GetModuleHandleA("stable-diffusion-real.dll");
+    if (!g_real && g_realpath[0])
+        g_real = LoadLibraryExA(g_realpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g_real) g_real = LoadLibraryA("stable-diffusion-real.dll");
     if (g_real) {
         real_generate_image = (gen_fn)GetProcAddress(g_real, "generate_image");
         real_params_to_str  = (to_str_fn)GetProcAddress(g_real, "sd_img_gen_params_to_str");
+        char path[1024];
+        if (GetModuleFileNameA(g_real, path, sizeof path))
+            logf_("real dll: %s\n", path);
     }
 }
 
+/* 構造体 (バイト列 p) の任意オフセットから int / ポインタを読み書きする
+ * ヘルパ。memcpy 経由にすることでアラインメントを気にせず安全に扱える */
 static int rd_i32(unsigned char* p, int off) { int v; memcpy(&v, p + off, 4); return v; }
 static void wr_i32(unsigned char* p, int off, int v) { memcpy(p + off, &v, 4); }
 static void* rd_ptr(unsigned char* p, int off) { void* v; memcpy(&v, p + off, sizeof v); return v; }
 static void wr_ptr(unsigned char* p, int off, void* v) { memcpy(p + off, &v, sizeof v); }
 
-/* -------- 安全なメモリ検査 (zig cc では SEH が使えないため) -------- */
+/* -------- 安全なメモリ検査 (zig cc では SEH が使えないため) --------
+ * 構造体レイアウトの想定が外れているとポインタの読み取りでクラッシュする。
+ * 例外ハンドラの代わりに VirtualQuery でページ属性を確認してから読む */
 
+/* [p, p+n) の全域が読み取り可能なコミット済みページに載っているか */
 static int mem_readable(const void* p, size_t n) {
     MEMORY_BASIC_INFORMATION mbi;
     const unsigned char* q = (const unsigned char*)p;
@@ -438,6 +521,8 @@ static int prompt_ok(unsigned char* p) {
 
 /* ---------------- プロンプト書き換え ---------------- */
 
+/* プロンプト書き換え系の設定が ini に 1 つでも存在するか。
+ * 無ければ書き換え処理 (とプロンプトの検証) を丸ごとスキップできる */
 static int lora_active(void) {
     if (g_map_n > 0 || g_rule_n > 0) return 1;
     for (int i = 0; i < 3; i++)
@@ -446,6 +531,7 @@ static int lora_active(void) {
     return 0;
 }
 
+/* 英数字か (単語境界の判定に使う) */
 static int is_alnum_c(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
@@ -749,154 +835,203 @@ static unsigned char* fixup_image(unsigned char* p, int w_off, int h_off, int c_
 
 /* ---------------- メインフック ---------------- */
 
+/* ゲームが呼ぶ generate_image の差し替え実体。処理の流れ:
+ *   (1) sd_upscale.ini を読み直す (ホットリロード。ゲーム再起動不要)
+ *   (2) 要求サイズから画像クラス (縦長 / 横長 / 正方形) を判定
+ *   (3) skip_if の判定 (書き換え前の、ゲーム本来のプロンプトで評価)
+ *   (4) プロンプト / ネガティブプロンプトの書き換え (ポインタ差し替え)
+ *   (5) サンプラー上書き (method / steps / cfg / scheduler)
+ *   (6) 解像度アップスケール (img2img の init/mask バッファも拡大)
+ *   (7) 本物の generate_image を呼ぶ
+ *   (8) 構造体を呼び出し前の状態へ完全に復元し、確保したメモリを解放
+ * params は sd_img_gen_params_t (フィールドオフセットは冒頭コメント参照)。
+ * アプリが同じ構造体を使い回しても壊れないよう、(8) の復元が重要 */
 __declspec(dllexport) void* generate_image(void* ctx, void* params) {
     ensure_real();
     g_calls++;
+    /* 本物が見つからない / params が NULL なら、何もせずできる範囲で素通し */
     if (!real_generate_image || !params) return real_generate_image ? real_generate_image(ctx, params) : NULL;
 
-    load_config();
+    load_config();   /* (1) 生成のたびに ini を読み直す */
 
+    /* (2) 構造体はバイト列 p として OFF_* オフセットで直接読み書きする */
     unsigned char* p = (unsigned char*)params;
-    int W = rd_i32(p, OFF_W), H = rd_i32(p, OFF_H);
+    int W = rd_i32(p, OFF_W), H = rd_i32(p, OFF_H);   /* ゲームが要求したサイズ */
+    /* サイズが常識の範囲外ならレイアウトの想定が崩れている。触らず素通し */
     if (W < 64 || W > 8192 || H < 64 || H > 8192) return real_generate_image(ctx, params);
     int cls = (W > H) ? CLS_LANDSCAPE : (W < H ? CLS_PORTRAIT : CLS_SQUARE);
 
-    /* ---- アップスケールのスキップ判定 ----
+    /* ---- (3) アップスケールのスキップ判定 ----
      * プロンプト書き換えでポインタが差し替わる前に、ゲーム本来のプロンプトに
      * 対して skip_if を評価しておく。プロンプトが検証できない場合 (prompt_ok
      * が偽) は判定できないため、スキップせず通常どおり動作する */
-    int up_on = g_enabled && g_enabled_cls[cls];
-    int up_skip = 0;
+    int up_on = g_enabled && g_enabled_cls[cls];   /* このクラスで拡大有効か */
+    int up_skip = 0;                               /* skip_if に一致したか */
     if (up_on && (g_skip_any[0] || g_skip_cls[cls][0]) && prompt_ok(p)) {
         const char* pr = (const char*)rd_ptr(p, OFF_PROMPT);
         if (pr && upscale_skip_match(pr, cls)) up_skip = 1;
     }
 
-    /* ---- LoRA / プロンプト注入 ---- */
-    char *np = NULL, *nn = NULL;
-    void *op = NULL, *on = NULL;
+    /* ---- (4) LoRA / プロンプト注入 ----
+     * new_* = malloc した書き換え後の文字列 (NULL = 書き換え不要だった)
+     * old_* = アプリが渡してきた元のポインタ (呼び出し後に戻すため保存) */
+    char *new_prompt = NULL, *new_neg = NULL;
+    void *old_prompt = NULL, *old_neg = NULL;
     if (lora_active() && prompt_ok(p)) {
-        op = rd_ptr(p, OFF_PROMPT);
-        if (op) {
-            np = rewrite_prompt((const char*)op, cls);
-            if (np) wr_ptr(p, OFF_PROMPT, np);
+        old_prompt = rd_ptr(p, OFF_PROMPT);
+        if (old_prompt) {
+            new_prompt = rewrite_prompt((const char*)old_prompt, cls);
+            if (new_prompt) wr_ptr(p, OFF_PROMPT, new_prompt);
         }
-        on = rd_ptr(p, OFF_NEG);
-        if (on && (g_negadd[cls][0] || g_negrepl[cls][0] || g_negrm[cls][0])) {
+        /* ネガティブ側は設定がある場合のみ。ポインタの読み取り可能性も
+         * (プロンプト側と違い未検証のため) ここで個別に確認する */
+        old_neg = rd_ptr(p, OFF_NEG);
+        if (old_neg && (g_negadd[cls][0] || g_negrepl[cls][0] || g_negrm[cls][0])) {
             int nlen;
-            if (str_readable((const char*)on, 65536, &nlen)) {
-                nn = rewrite_negative((const char*)on, cls);
-                if (nn) wr_ptr(p, OFF_NEG, nn);
+            if (str_readable((const char*)old_neg, 65536, &nlen)) {
+                new_neg = rewrite_negative((const char*)old_neg, cls);
+                if (new_neg) wr_ptr(p, OFF_NEG, new_neg);
             }
         }
-        if ((np || nn) && g_calls <= 8) {
-            if (np) logf_("call %d: [%s] prompt rewritten: %.300s%s\n",
-                          g_calls, CLS_NAME[cls], np, strlen(np) > 300 ? "..." : "");
-            if (nn) logf_("call %d: [%s] negative rewritten: %.200s%s\n",
-                          g_calls, CLS_NAME[cls], nn, strlen(nn) > 200 ? "..." : "");
+        /* 書き換え結果は最初の数回だけログに残す (動作確認用) */
+        if ((new_prompt || new_neg) && g_calls <= 8) {
+            if (new_prompt) logf_("call %d: [%s] prompt rewritten: %.300s%s\n",
+                          g_calls, CLS_NAME[cls], new_prompt, strlen(new_prompt) > 300 ? "..." : "");
+            if (new_neg) logf_("call %d: [%s] negative rewritten: %.200s%s\n",
+                          g_calls, CLS_NAME[cls], new_neg, strlen(new_neg) > 200 ? "..." : "");
         }
     }
 
-    /* ---- サンプラー上書き ---- */
-    int   sv_method = 0, sv_sched = 0, sv_steps = 0;
-    float sv_cfg = 0.0f;
-    int   smp_applied = 0;
+    /* ---- (5) サンプラー上書き ----
+     * saved_* は復元用に取っておく呼び出し前の値。初回は現在のフィールド値が
+     * 列挙値・妥当な範囲に収まっているかを確認し (レイアウト検証を兼ねる)、
+     * 疑わしければ g_smp_state = -1 にしてこの機能だけ以後停止する */
+    int   saved_method = 0, saved_sched = 0, saved_steps = 0;
+    float saved_cfg = 0.0f;
+    int   smp_applied = 0;   /* 実際に書き換えたか (= 復元が必要か) */
     if (g_smp_state >= 0 &&
         (g_smp_method[cls][0] || g_smp_sched[cls][0] || g_smp_steps[cls] || g_smp_cfg[cls] > 0.0f)) {
-        int cur_m = rd_i32(p, OFF_METHOD), cur_s = rd_i32(p, OFF_STEPS), cur_sc = rd_i32(p, OFF_SCHED);
-        float cur_c; memcpy(&cur_c, p + OFF_CFG, 4);
-        if (cur_m < 0 || cur_m > 11 || cur_s < 1 || cur_s > 500 || cur_sc < 0 || cur_sc > 6 ||
-            !(cur_c >= 0.0f && cur_c <= 50.0f)) {
+        int cur_method = rd_i32(p, OFF_METHOD), cur_steps = rd_i32(p, OFF_STEPS), cur_sched = rd_i32(p, OFF_SCHED);
+        float cur_cfg; memcpy(&cur_cfg, p + OFF_CFG, 4);
+        if (cur_method < 0 || cur_method > 11 || cur_steps < 1 || cur_steps > 500 ||
+            cur_sched < 0 || cur_sched > 6 || !(cur_cfg >= 0.0f && cur_cfg <= 50.0f)) {
             if (g_smp_state == 0)
                 logf_("sampler: layout sanity check failed (m=%d s=%d sc=%d cfg=%.2f), override disabled\n",
-                      cur_m, cur_s, cur_sc, cur_c);
+                      cur_method, cur_steps, cur_sched, cur_cfg);
             g_smp_state = -1;
         } else {
             g_smp_state = 1;
-            sv_method = cur_m; sv_steps = cur_s; sv_sched = cur_sc; sv_cfg = cur_c;
-            int nm = cur_m, nsc = cur_sc, ns = cur_s;
-            float nc = cur_c;
+            saved_method = cur_method; saved_steps = cur_steps; saved_sched = cur_sched; saved_cfg = cur_cfg;
+            /* ini に書かれている項目だけ差し替える (未記入はゲームの値のまま) */
+            int new_method = cur_method, new_sched = cur_sched, new_steps = cur_steps;
+            float new_cfg = cur_cfg;
             if (g_smp_method[cls][0]) {
                 int e = name_to_enum(g_smp_method[cls], METHOD_NAMES, 12);
-                if (e >= 0) nm = e;
+                if (e >= 0) new_method = e;
                 else if (g_calls <= 8) logf_("sampler: unknown method '%s' ignored\n", g_smp_method[cls]);
             }
             if (g_smp_sched[cls][0]) {
                 int e = name_to_enum(g_smp_sched[cls], SCHED_NAMES, 7);
-                if (e >= 0) nsc = e;
+                if (e >= 0) new_sched = e;
                 else if (g_calls <= 8) logf_("sampler: unknown scheduler '%s' ignored\n", g_smp_sched[cls]);
             }
-            if (g_smp_steps[cls])      ns = g_smp_steps[cls];
-            if (g_smp_cfg[cls] > 0.0f) nc = g_smp_cfg[cls];
-            if (nm != cur_m || nsc != cur_sc || ns != cur_s || nc != cur_c) {
-                wr_i32(p, OFF_METHOD, nm); wr_i32(p, OFF_SCHED, nsc); wr_i32(p, OFF_STEPS, ns);
-                memcpy(p + OFF_CFG, &nc, 4);
+            if (g_smp_steps[cls])      new_steps = g_smp_steps[cls];
+            if (g_smp_cfg[cls] > 0.0f) new_cfg = g_smp_cfg[cls];
+            if (new_method != cur_method || new_sched != cur_sched ||
+                new_steps != cur_steps || new_cfg != cur_cfg) {
+                wr_i32(p, OFF_METHOD, new_method); wr_i32(p, OFF_SCHED, new_sched);
+                wr_i32(p, OFF_STEPS, new_steps);
+                memcpy(p + OFF_CFG, &new_cfg, 4);
                 smp_applied = 1;
                 if (g_calls <= 20)
                     logf_("call %d: [%s] sampler %s/%d/%.1f -> %s/%d/%.1f\n",
                           g_calls, CLS_NAME[cls],
-                          METHOD_NAMES[cur_m], cur_s, cur_c, METHOD_NAMES[nm], ns, nc);
+                          METHOD_NAMES[cur_method], cur_steps, cur_cfg,
+                          METHOD_NAMES[new_method], new_steps, new_cfg);
             }
         }
     }
 
-    /* ---- 解像度アップスケール ---- */
+    /* ---- (6) 解像度アップスケール ----
+     * 新サイズ (nW, nH) の決め方: 「短辺を goal まで上げる拡大率」と
+     * 「長辺が lim を超えない拡大率」の小さい方を採用 (縮小はしない)。
+     * img2img の場合、アプリは init/mask バッファを元のサイズで確保して
+     * いるため、テンポラリへバイリニア拡大してポインタを差し替える
+     * (これをしないと本物側が新サイズでバッファ範囲外を読んで落ちる) */
     int scaled = 0, nW = W, nH = H;
-    int iw = 0, ih = 0, ic = 0, mw = 0, mh = 0, mc = 0;
-    void *id = NULL, *md = NULL;
-    unsigned char *ni = NULL, *nm = NULL;
+    int init_w = 0, init_h = 0, init_c = 0;             /* 差し替え前の init_image (復元用) */
+    int mask_w = 0, mask_h = 0, mask_c = 0;             /* 差し替え前の mask_image (復元用) */
+    void *init_data = NULL, *mask_data = NULL;          /* 元のピクセルバッファ */
+    unsigned char *init_tmp = NULL, *mask_tmp = NULL;   /* 拡大後のテンポラリ (要 free) */
     if (up_on && !up_skip) {
-        int gs = g_goal_short, ml = g_max_long;
+        int goal = g_goal_short, lim = g_max_long;
         if (W > H) {  /* 横長 (背景) は VRAM 対策で低めの上限を使える */
-            if (g_goal_short_land > 0) gs = g_goal_short_land;
-            if (g_max_long_land   > 0) ml = g_max_long_land;
+            if (g_goal_short_land > 0) goal = g_goal_short_land;
+            if (g_max_long_land   > 0) lim = g_max_long_land;
         }
-        int S = W < H ? W : H, L = W < H ? H : W;
-        double f1 = (double)gs / (double)S, f2 = (double)ml / (double)L;
+        int S = W < H ? W : H, L = W < H ? H : W;      /* 短辺 / 長辺 */
+        double f1 = (double)goal / (double)S;          /* 短辺を目標にする拡大率 */
+        double f2 = (double)lim  / (double)L;          /* 長辺上限までの拡大率 */
         double f = f1 < f2 ? f1 : f2;
-        if (f < 1.0) f = 1.0;
+        if (f < 1.0) f = 1.0;                          /* 縮小はしない */
         nW = snap((int)(W * f + 0.5)); nH = snap((int)(H * f + 0.5));
         if (nW != W || nH != H) {
-            ni = fixup_image(p, OFF_INIT_W, OFF_INIT_H, OFF_INIT_C, OFF_INIT_D, nW, nH, &iw, &ih, &ic, &id);
-            nm = fixup_image(p, OFF_MASK_W, OFF_MASK_H, OFF_MASK_C, OFF_MASK_D, nW, nH, &mw, &mh, &mc, &md);
+            init_tmp = fixup_image(p, OFF_INIT_W, OFF_INIT_H, OFF_INIT_C, OFF_INIT_D,
+                                   nW, nH, &init_w, &init_h, &init_c, &init_data);
+            mask_tmp = fixup_image(p, OFF_MASK_W, OFF_MASK_H, OFF_MASK_C, OFF_MASK_D,
+                                   nW, nH, &mask_w, &mask_h, &mask_c, &mask_data);
             wr_i32(p, OFF_W, nW); wr_i32(p, OFF_H, nH);
             scaled = 1;
         }
     }
 
+    /* 最初の 20 回だけ、この呼び出しで何をしたかをログに残す */
     if (g_calls <= 20) {
         if (scaled)
             logf_("call %d: %dx%d -> %dx%d  [%s]  init=%s(%dx%dx%d) mask=%s(%dx%dx%d)%s\n",
                   g_calls, W, H, nW, nH, CLS_NAME[cls],
-                  ni ? "up" : (id ? "keep" : "none"), iw, ih, ic,
-                  nm ? "up" : (md ? "keep" : "none"), mw, mh, mc,
-                  np ? "  +prompt" : "");
+                  init_tmp ? "up" : (init_data ? "keep" : "none"), init_w, init_h, init_c,
+                  mask_tmp ? "up" : (mask_data ? "keep" : "none"), mask_w, mask_h, mask_c,
+                  new_prompt ? "  +prompt" : "");
         else
             logf_("call %d: %dx%d (no scale%s)  [%s]%s\n", g_calls, W, H,
                   up_skip ? ": skip_if" : (!up_on ? ": disabled" : ""),
-                  CLS_NAME[cls], np ? "  +prompt" : "");
+                  CLS_NAME[cls], new_prompt ? "  +prompt" : "");
     }
 
+    /* ---- (7) 本物の generate_image を呼ぶ ---- */
     void* result = real_generate_image(ctx, params);
 
-    /* 構造体をアプリから渡された状態へ復元し、テンポラリを解放する */
+    /* ---- (8) 構造体をアプリから渡された状態へ復元し、テンポラリを解放 ---- */
     if (scaled) {
         wr_i32(p, OFF_W, W); wr_i32(p, OFF_H, H);
-        if (ni) { wr_i32(p, OFF_INIT_W, iw); wr_i32(p, OFF_INIT_H, ih); wr_ptr(p, OFF_INIT_D, id); free(ni); }
-        if (nm) { wr_i32(p, OFF_MASK_W, mw); wr_i32(p, OFF_MASK_H, mh); wr_ptr(p, OFF_MASK_D, md); free(nm); }
+        if (init_tmp) {
+            wr_i32(p, OFF_INIT_W, init_w); wr_i32(p, OFF_INIT_H, init_h);
+            wr_ptr(p, OFF_INIT_D, init_data); free(init_tmp);
+        }
+        if (mask_tmp) {
+            wr_i32(p, OFF_MASK_W, mask_w); wr_i32(p, OFF_MASK_H, mask_h);
+            wr_ptr(p, OFF_MASK_D, mask_data); free(mask_tmp);
+        }
     }
     if (smp_applied) {
-        wr_i32(p, OFF_METHOD, sv_method); wr_i32(p, OFF_SCHED, sv_sched); wr_i32(p, OFF_STEPS, sv_steps);
-        memcpy(p + OFF_CFG, &sv_cfg, 4);
+        wr_i32(p, OFF_METHOD, saved_method); wr_i32(p, OFF_SCHED, saved_sched);
+        wr_i32(p, OFF_STEPS, saved_steps);
+        memcpy(p + OFF_CFG, &saved_cfg, 4);
     }
-    if (np) { wr_ptr(p, OFF_PROMPT, op); free(np); }
-    if (nn) { wr_ptr(p, OFF_NEG, on); free(nn); }
+    if (new_prompt) { wr_ptr(p, OFF_PROMPT, old_prompt); free(new_prompt); }
+    if (new_neg)    { wr_ptr(p, OFF_NEG, old_neg); free(new_neg); }
     return result;
 }
 
+/* DLL エントリポイント。プロセスにロードされた時点で、正しいバックエンドの
+ * 本物 DLL を先行ロードしておく (理由は load_real_beside_proxy のコメント参照) */
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h);
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        load_real_beside_proxy(h);
+    }
     return TRUE;
 }
 

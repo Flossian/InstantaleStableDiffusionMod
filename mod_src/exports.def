@@ -7,8 +7,13 @@
 ; (stable-diffusion-real.dll) の同名関数へ呼び出しを丸ごと転送する。
 ; これによりゲーム側は API 互換のまま、generate_image のみ差し替えられる。
 ;
-; 注意: フォワード先の stable-diffusion-real.dll をゲームルート直下に
-; 置いておくこと。無いとこれらのエクスポートは解決できずロードに失敗する。
+; 注意: フォワード先の stable-diffusion-real.dll はプロキシ自身と同じ
+; フォルダ (sdcpp_<バックエンド>\lib\) に置く。proxy.c の DllMain が
+; フルパスで先にロードするため、フォワーダのモジュール名解決は
+; ロード済みのそのモジュールへ束縛される (バックエンドごとに本物 DLL が
+; 異なるため)。同じフォルダに無い場合は通常の DLL 検索順により
+; ゲームルート直下の stable-diffusion-real.dll が使われる (v1 互換)。
+; どちらにも無いとこれらのエクスポートは解決できずロードに失敗する。
 EXPORTS
 convert=stable-diffusion-real.convert
 free_sd_ctx=stable-diffusion-real.free_sd_ctx
