@@ -138,4 +138,4 @@ python -m ziglang cc -target x86_64-windows-gnu -O2 -shared ^
 
 ## ライセンス
 
-本リポジトリのコードは [LICENSE](LICENSE) を参照。各自でダウンロードして使うモデル（SDXL チェックポイント、TAESDXL、LCM-LoRA 等）は、それぞれの配布元ライセンスに従ってください。
+本リポジトリのコードは **[MIT License](LICENSE)** で公開しています。各自でダウンロードして使うモデル（SDXL チェックポイント、TAESDXL、LCM-LoRA 等）は、それぞれの配布元ライセンスに従ってください。
